@@ -25,6 +25,8 @@ This gives operators and tooling a single, consistent source of truth for featur
 | `phase` | Yes | `Deprecated` (still works, migrate soon) or `Removed` (no longer available) |
 | `deprecatedInVersion` | Yes | Platform version when deprecation was announced (`major.minor`) |
 | `removedInVersion` | Yes | Platform version when the feature is/was removed (`major.minor`) |
+| `plannedEarliestRemoval` | No | Expected GA date of `removedInVersion` (`YYYY-MM-DD`). The earliest date the feature will be absent from new installs. |
+| `plannedEndOfLife` | No | EOL date of the last version that still includes this feature (`YYYY-MM-DD`). Existing clusters have access until this date, which may be years after `plannedEarliestRemoval`. |
 | `reason` | Yes | Explanation of why the feature is being deprecated |
 | `replacedBy` | No | Feature or API that supersedes this one |
 | `migrationGuide` | No | URL pointing to migration documentation |
@@ -64,6 +66,8 @@ spec:
 
   deprecatedInVersion: "5.2"
   removedInVersion: "6.0"
+  plannedEarliestRemoval: "2029-10-01"   # 6.0 GA — no longer available on new installs
+  plannedEndOfLife: "2034-06-30"         # 5.8 EOL — last date any cluster can run it
 
   reason: >
     The upstream Kubernetes project removed in-tree cloud provider volume

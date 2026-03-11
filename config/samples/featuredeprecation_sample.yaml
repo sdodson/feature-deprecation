@@ -1,0 +1,71 @@
+---
+# Example 1: Feature deprecated in 5.2, not yet removed.
+# Controller will set Removed=False until cluster reaches 6.0.
+apiVersion: deprecation.openshift.io/v1alpha1
+kind: FeatureDeprecation
+metadata:
+  # Name should be a stable, URL-safe slug for the feature.
+  name: intree-vsphere-volume-plugin
+spec:
+  feature:
+    name: "In-tree vSphere volume plugin"
+    description: >
+      The legacy in-tree vSphere volume plugin (kubernetes.io/vsphere-volume)
+      allowed clusters to provision and attach vSphere VMDK volumes directly
+      via the Kubernetes volume subsystem without a separate CSI driver.
+    component: storage
+
+  phase: Deprecated
+
+  deprecatedInVersion: "5.2"
+  removedInVersion: "6.0"
+  plannedEarliestRemoval: "2029-10-01"
+  plannedEndOfLife: "2034-06-30"
+
+  reason: >
+    The upstream Kubernetes project removed in-tree cloud provider volume
+    plugins in favour of the Container Storage Interface (CSI). The in-tree
+    vSphere plugin is no longer maintained and will not receive security fixes.
+
+  replacedBy: "vSphere CSI driver (kubernetes-sigs/vsphere-csi-driver)"
+
+  migrationGuide: "https://docs.openshift.com/container-platform/5.2/storage/container_storage_interface/persistent-storage-csi-vsphere.html"
+
+---
+# Example 2: Feature already removed — phase=Removed.
+# Controller will set Removed=True once cluster is on 6.0+.
+# CEL rule requires replacedBy or migrationGuide when phase=Removed.
+apiVersion: deprecation.openshift.io/v1alpha1
+kind: FeatureDeprecation
+metadata:
+  name: oauth-htpasswd-secret-v1
+spec:
+  feature:
+    name: "HTPasswd identity provider v1 secret format"
+    description: >
+      The original HTPasswd identity provider read credentials from a
+      ConfigMap rather than a Secret, exposing password hashes without
+      at-rest encryption. The v1 format was replaced by a Secret-backed
+      implementation in 4.14.
+    component: authentication
+
+  phase: Removed
+
+  deprecatedInVersion: "5.1"
+  removedInVersion: "6.0"
+  plannedEarliestRemoval: "2029-10-01"
+  plannedEndOfLife: "2034-06-30"
+
+  reason: >
+    The ConfigMap-backed HTPasswd format stored credential hashes without
+    Kubernetes Secret encryption-at-rest protections, creating an unnecessary
+    security exposure. All identity providers must use Secrets.
+
+  replacedBy: "HTPasswd identity provider backed by a kubernetes.io/Opaque Secret"
+
+  migrationGuide: "https://docs.openshift.com/container-platform/5.1/authentication/identity_providers/configuring-htpasswd-identity-provider.html#identity-provider-htpasswd-secret"
+
+  additionalInfo: >
+    Clusters upgrading to 6.0 with an existing v1 HTPasswd configuration will
+    have their identity provider disabled at upgrade time. Run the migration
+    script (linked in migrationGuide) before upgrading.
