@@ -1,4 +1,5 @@
 // Package v1alpha1 contains API Schema definitions for the deprecation.openshift.io API group.
+// +kubebuilder:object:generate=true
 // +groupName=deprecation.openshift.io
 package v1alpha1
 
