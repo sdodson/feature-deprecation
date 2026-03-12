@@ -59,15 +59,27 @@ Key spec fields:
 - `feature.{name,description,component}` — identifies the feature
 - `phase` — `Deprecated` or `Removed`
 - `deprecatedInVersion` / `removedInVersion` — `<major>.<minor>` format
+- `plannedEarliestRemoval` / `plannedEndOfLife` — `YYYY-MM-DD` dates
 - `reason`, `replacedBy`, `migrationGuide`, `additionalInfo`
+- `featureInUseMatchingRule` — optional discriminated union for detecting active feature usage (see below)
 
 CEL validation rules enforced by the CRD:
 1. `removedInVersion` major must be strictly greater than `deprecatedInVersion` major (features are deprecated in a minor release and removed in the next major release)
 2. When `phase=Removed`, either `replacedBy` or `migrationGuide` must be set
+3. `featureInUseMatchingRule`: when `type=PromQL`, `promQL` must be set and `resourceJSONPath` must be absent; when `type=ResourceJSONPath`, `resourceJSONPath` must be set and `promQL` must be absent
 
 Status conditions set by the controller:
 - `Removed` — `True` when cluster version >= `removedInVersion`; `False` otherwise; `Unknown` when `ClusterVersion` is unavailable
 - `MigrationDocumented` — `True` when `replacedBy` or `migrationGuide` is populated
+- `FeatureInUse` — set only when `featureInUseMatchingRule` is present; `True` when the rule detects active usage, `False` when not in use, `Unknown` on evaluation errors
+
+### featureInUseMatchingRule
+
+A discriminated union on the `type` field. Two types are defined:
+
+**`PromQL`** — evaluates `promQL.query` against the Prometheus-compatible endpoint configured by `--prometheus-url` (default: `https://thanos-querier.openshift-monitoring.svc:9091`). Non-zero results → `FeatureInUse=True`. The HTTP client is built from the controller's in-cluster REST config (bearer token + cluster CA).
+
+**`ResourceJSONPath`** — fetches a Kubernetes resource via the dynamic client using `{group, version, resource, name, namespace}`, then evaluates `jsonPath` (curly braces optional) and compares the result to `expectedValue`. Resource not found → `FeatureInUse=False`. The controller service account needs `get` RBAC on each referenced resource type — this is not auto-generated.
 
 ### Controller behavior
 
@@ -76,6 +88,11 @@ The controller (`internal/controller/featuredeprecation_controller.go`) watches:
 2. `ClusterVersion` (name=`version`) from `config.openshift.io/v1` — any change fans out to reconcile all `FeatureDeprecation` objects
 
 `ClusterVersion` is fetched via an unstructured client to avoid importing the typed openshift/api client; version is read from `.status.desired.version`. The reconciler compares major.minor only, stripping pre-release and build metadata suffixes.
+
+`FeatureDeprecationReconciler` has three additional fields wired up in `main.go`:
+- `DynamicClient dynamic.Interface` — for ResourceJSONPath resource fetches
+- `PrometheusURL string` — base URL for PromQL queries (flag: `--prometheus-url`)
+- `HTTPClient *http.Client` — built via `rest.HTTPClientFor(cfg)` for PromQL HTTP calls
 
 ### Code generation workflow
 
