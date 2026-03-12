@@ -1,6 +1,8 @@
 ---
 # Example 1: Feature deprecated in 5.2, not yet removed.
 # Controller will set Removed=False until cluster reaches 6.0.
+# featureInUseMatchingRule uses PromQL to detect whether any node still
+# reports in-tree vSphere volumes; FeatureInUse=True means migration is needed.
 apiVersion: deprecation.openshift.io/v1alpha1
 kind: FeatureDeprecation
 metadata:
@@ -31,10 +33,18 @@ spec:
 
   migrationGuide: "https://docs.openshift.com/container-platform/5.2/storage/container_storage_interface/persistent-storage-csi-vsphere.html"
 
+  featureInUseMatchingRule:
+    type: PromQL
+    promQL:
+      query: 'sum(openshift_storage_intree_plugin_usage_total{plugin="vsphere"}) > 0'
+
 ---
 # Example 2: Feature already removed — phase=Removed.
 # Controller will set Removed=True once cluster is on 6.0+.
 # CEL rule requires replacedBy or migrationGuide when phase=Removed.
+# featureInUseMatchingRule uses ResourceJSONPath to detect whether the
+# HTPasswd identity provider is still configured; checks for the presence
+# of the legacy ConfigMap-backed provider type in the OAuth cluster config.
 apiVersion: deprecation.openshift.io/v1alpha1
 kind: FeatureDeprecation
 metadata:
@@ -69,3 +79,13 @@ spec:
     Clusters upgrading to 6.0 with an existing v1 HTPasswd configuration will
     have their identity provider disabled at upgrade time. Run the migration
     script (linked in migrationGuide) before upgrading.
+
+  featureInUseMatchingRule:
+    type: ResourceJSONPath
+    resourceJSONPath:
+      group: config.openshift.io
+      version: v1
+      resource: oauths
+      name: cluster
+      jsonPath: .spec.identityProviders[0].type
+      expectedValue: HTPasswd
