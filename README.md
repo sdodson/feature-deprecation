@@ -8,6 +8,7 @@ Platform teams create `FeatureDeprecation` objects to document features that hav
 
 - **`Removed`** — whether the running cluster version has reached or passed the `removedInVersion`
 - **`MigrationDocumented`** — whether a migration path (`replacedBy` or `migrationGuide`) has been documented
+- **`FeatureInUse`** — whether the cluster is actively using the feature, evaluated via an optional `featureInUseMatchingRule`
 
 This gives operators and tooling a single, consistent source of truth for feature lifecycle state.
 
@@ -31,6 +32,51 @@ This gives operators and tooling a single, consistent source of truth for featur
 | `replacedBy` | No | Feature or API that supersedes this one |
 | `migrationGuide` | No | URL pointing to migration documentation |
 | `additionalInfo` | No | Supplemental information not covered by other fields |
+| `featureInUseMatchingRule` | No | Rule for detecting whether the cluster is actively using this feature (see below) |
+
+### featureInUseMatchingRule
+
+An optional discriminated union that tells the controller how to detect active feature usage. Set `type` to one of the values below and populate the corresponding sub-field; the other sub-field must be omitted.
+
+#### `type: PromQL`
+
+Evaluates a PromQL expression against the cluster's Prometheus (via thanos-querier). The feature is considered in use when the query returns at least one result with a non-zero value.
+
+| Field | Required | Description |
+|---|---|---|
+| `promQL.query` | Yes | PromQL expression to evaluate (max 2048 characters) |
+
+```yaml
+featureInUseMatchingRule:
+  type: PromQL
+  promQL:
+    query: 'sum(vsphere_volume_plugin_in_use) > 0'
+```
+
+#### `type: ResourceJSONPath`
+
+Fetches a Kubernetes resource and checks whether a JSONPath expression resolves to an expected string value. The feature is considered in use when the values match; if the resource is not found the condition is `False`.
+
+| Field | Required | Description |
+|---|---|---|
+| `resourceJSONPath.group` | No | API group (empty string for the core group) |
+| `resourceJSONPath.version` | Yes | API version (e.g. `v1`) |
+| `resourceJSONPath.resource` | Yes | Plural resource name (e.g. `clusterversions`) |
+| `resourceJSONPath.name` | Yes | Name of the resource instance to fetch |
+| `resourceJSONPath.namespace` | No | Namespace; omit for cluster-scoped resources |
+| `resourceJSONPath.jsonPath` | Yes | Dot-notation path into the resource (e.g. `.spec.channel`); curly braces are optional |
+| `resourceJSONPath.expectedValue` | Yes | String value the JSONPath result must equal |
+
+```yaml
+featureInUseMatchingRule:
+  type: ResourceJSONPath
+  resourceJSONPath:
+    version: v1
+    resource: clusterversions
+    name: version
+    jsonPath: .spec.channel
+    expectedValue: stable-4.14
+```
 
 ### Validation rules
 
@@ -45,6 +91,9 @@ The CRD enforces the following via CEL:
 |---|---|---|---|
 | `Removed` | Cluster version >= `removedInVersion` | Cluster version < `removedInVersion` | `ClusterVersion` is unavailable or unparseable |
 | `MigrationDocumented` | `replacedBy` or `migrationGuide` is set | Neither field is set | — |
+| `FeatureInUse` | Matching rule detects active usage | Rule finds no usage (or resource not found) | Rule evaluation fails (network error, bad JSONPath, etc.) |
+
+`FeatureInUse` is only set when `featureInUseMatchingRule` is present in the spec.
 
 ### Example
 
@@ -163,3 +212,5 @@ make vet    # go vet ./...
 - **ClusterVersion watch**: The controller watches `ClusterVersion` (name=`version`) from `config.openshift.io/v1`. Any change fans out reconcile requests to all `FeatureDeprecation` objects, keeping status current whenever the cluster upgrades.
 - **Unstructured client**: `ClusterVersion` is fetched via an unstructured client to avoid importing typed openshift/api clients, keeping the dependency footprint minimal. Version is read from `.status.desired.version`.
 - **Version comparison**: Only `major.minor` is compared; patch versions, pre-release identifiers, and build metadata are stripped before comparison.
+- **PromQL evaluation**: Queries are sent to the URL configured by `--prometheus-url` (default: `https://thanos-querier.openshift-monitoring.svc:9091`). The HTTP client is built from the controller's in-cluster REST config, so it inherits the service account bearer token and cluster CA — the same RBAC that governs Prometheus access via the OpenShift monitoring stack applies.
+- **ResourceJSONPath evaluation**: Resources are fetched via a dynamic client. The controller's service account must be granted `get` on any resource type referenced by a `ResourceJSONPath` rule; this RBAC is not generated automatically and must be configured per deployment.
