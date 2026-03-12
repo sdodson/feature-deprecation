@@ -1,8 +1,11 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -12,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/util/jsonpath"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +42,19 @@ var clusterVersionGVK = schema.GroupVersionKind{
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterversions,verbs=get;list;watch
 type FeatureDeprecationReconciler struct {
 	client.Client
+
+	// DynamicClient is used to fetch arbitrary resources for ResourceJSONPath rules.
+	// Additional RBAC must be granted to the controller's service account for each
+	// resource type referenced by a ResourceJSONPath rule.
+	DynamicClient dynamic.Interface
+
+	// PrometheusURL is the base URL of the Prometheus-compatible API used for
+	// PromQL rules (e.g. "https://thanos-querier.openshift-monitoring.svc:9091").
+	PrometheusURL string
+
+	// HTTPClient is used for PromQL rule evaluation. It must be configured with
+	// the appropriate TLS settings and bearer-token transport for the cluster.
+	HTTPClient *http.Client
 }
 
 func (r *FeatureDeprecationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -135,7 +153,167 @@ func (r *FeatureDeprecationReconciler) Reconcile(ctx context.Context, req ctrl.R
 		})
 	}
 
+	if fd.Spec.FeatureInUseMatchingRule != nil {
+		cond := r.evaluateFeatureInUse(ctx, fd)
+		apimeta.SetStatusCondition(&fd.Status.Conditions, cond)
+	}
+
 	return ctrl.Result{}, r.Status().Patch(ctx, fd, client.MergeFrom(base))
+}
+
+// evaluateFeatureInUse dispatches to the appropriate rule evaluator and returns
+// the resulting FeatureInUse condition.
+func (r *FeatureDeprecationReconciler) evaluateFeatureInUse(ctx context.Context, fd *deprecationv1alpha1.FeatureDeprecation) metav1.Condition {
+	rule := fd.Spec.FeatureInUseMatchingRule
+	base := metav1.Condition{
+		Type:               deprecationv1alpha1.ConditionFeatureInUse,
+		ObservedGeneration: fd.Generation,
+	}
+	switch rule.Type {
+	case deprecationv1alpha1.FeatureInUseRuleTypePromQL:
+		return r.evaluatePromQL(ctx, rule.PromQL, base)
+	case deprecationv1alpha1.FeatureInUseRuleTypeResourceJSONPath:
+		return r.evaluateResourceJSONPath(ctx, rule.ResourceJSONPath, base)
+	default:
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "UnknownRuleType"
+		base.Message = fmt.Sprintf("Unrecognized featureInUseMatchingRule type %q", rule.Type)
+		return base
+	}
+}
+
+// evaluatePromQL queries Prometheus with the configured PromQL expression and
+// returns True when at least one result has a non-zero value.
+func (r *FeatureDeprecationReconciler) evaluatePromQL(ctx context.Context, rule *deprecationv1alpha1.PromQLRule, base metav1.Condition) metav1.Condition {
+	queryURL := r.PrometheusURL + "/api/v1/query"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if err != nil {
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "PromQLRequestFailed"
+		base.Message = fmt.Sprintf("Failed to build Prometheus request: %v", err)
+		return base
+	}
+	q := req.URL.Query()
+	q.Set("query", rule.Query)
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := r.HTTPClient.Do(req)
+	if err != nil {
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "PromQLRequestFailed"
+		base.Message = fmt.Sprintf("Failed to query Prometheus: %v", err)
+		return base
+	}
+	defer resp.Body.Close()
+
+	// Prometheus HTTP API response envelope.
+	var envelope struct {
+		Status string `json:"status"`
+		Data   struct {
+			Result []struct {
+				// Value is [unixTimestamp, "stringValue"].
+				Value []json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "PromQLParseFailed"
+		base.Message = fmt.Sprintf("Failed to decode Prometheus response: %v", err)
+		return base
+	}
+	if envelope.Status != "success" {
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "PromQLQueryFailed"
+		base.Message = fmt.Sprintf("Prometheus returned non-success status %q for query %q", envelope.Status, rule.Query)
+		return base
+	}
+
+	for _, result := range envelope.Data.Result {
+		if len(result.Value) < 2 {
+			continue
+		}
+		var valueStr string
+		if err := json.Unmarshal(result.Value[1], &valueStr); err != nil {
+			continue
+		}
+		if valueStr != "0" && valueStr != "0.0" {
+			base.Status = metav1.ConditionTrue
+			base.Reason = "PromQLMatchFound"
+			base.Message = "Prometheus query returned non-zero results indicating the feature is in use"
+			return base
+		}
+	}
+
+	base.Status = metav1.ConditionFalse
+	base.Reason = "PromQLNoMatch"
+	base.Message = "Prometheus query returned no non-zero results; feature does not appear to be in use"
+	return base
+}
+
+// evaluateResourceJSONPath fetches the specified resource and checks whether
+// the JSONPath expression resolves to the expected value.
+func (r *FeatureDeprecationReconciler) evaluateResourceJSONPath(ctx context.Context, rule *deprecationv1alpha1.ResourceJSONPathRule, base metav1.Condition) metav1.Condition {
+	gvr := schema.GroupVersionResource{
+		Group:    rule.Group,
+		Version:  rule.Version,
+		Resource: rule.Resource,
+	}
+
+	var obj *unstructured.Unstructured
+	var err error
+	if rule.Namespace != "" {
+		obj, err = r.DynamicClient.Resource(gvr).Namespace(rule.Namespace).Get(ctx, rule.Name, metav1.GetOptions{})
+	} else {
+		obj, err = r.DynamicClient.Resource(gvr).Get(ctx, rule.Name, metav1.GetOptions{})
+	}
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			base.Status = metav1.ConditionFalse
+			base.Reason = "ResourceNotFound"
+			base.Message = fmt.Sprintf("Resource %s/%s not found; feature does not appear to be in use", rule.Resource, rule.Name)
+			return base
+		}
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "ResourceFetchFailed"
+		base.Message = fmt.Sprintf("Failed to fetch %s/%s: %v", rule.Resource, rule.Name, err)
+		return base
+	}
+
+	// Wrap the expression in curly braces if the caller omitted them.
+	expr := rule.JSONPath
+	if !strings.HasPrefix(expr, "{") {
+		expr = "{" + expr + "}"
+	}
+
+	j := jsonpath.New("feature-in-use")
+	if err := j.Parse(expr); err != nil {
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "JSONPathParseFailed"
+		base.Message = fmt.Sprintf("Failed to parse JSONPath %q: %v", rule.JSONPath, err)
+		return base
+	}
+
+	var buf bytes.Buffer
+	if err := j.Execute(&buf, obj.Object); err != nil {
+		base.Status = metav1.ConditionUnknown
+		base.Reason = "JSONPathEvalFailed"
+		base.Message = fmt.Sprintf("Failed to evaluate JSONPath %q on %s/%s: %v", rule.JSONPath, rule.Resource, rule.Name, err)
+		return base
+	}
+
+	actual := buf.String()
+	if actual == rule.ExpectedValue {
+		base.Status = metav1.ConditionTrue
+		base.Reason = "JSONPathMatched"
+		base.Message = fmt.Sprintf("JSONPath %q on %s/%s matches expected value", rule.JSONPath, rule.Resource, rule.Name)
+		return base
+	}
+
+	base.Status = metav1.ConditionFalse
+	base.Reason = "JSONPathNoMatch"
+	base.Message = fmt.Sprintf("JSONPath %q on %s/%s is %q; expected %q", rule.JSONPath, rule.Resource, rule.Name, actual, rule.ExpectedValue)
+	return base
 }
 
 // SetupWithManager sets up the controller with the Manager, including a watch
